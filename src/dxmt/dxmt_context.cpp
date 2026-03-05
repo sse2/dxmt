@@ -74,11 +74,11 @@ ArgumentEncodingContext::encodeVertexBuffers(uint32_t slot_mask, uint64_t offset
       entries[index++].length = 0;
       continue;
     }
-    auto length = buffer->length();
-    auto [buffer_alloc, buffer_offset] = access(buffer, DXMT_ENCODER_RESOURCE_ACESS_READ);
+    auto valid_length = buffer->length() > state.offset ? buffer->length() - state.offset : 0;
+    auto [buffer_alloc, buffer_offset] = access<true>(buffer, state.offset, valid_length, DXMT_ENCODER_RESOURCE_ACESS_READ);
     entries[index].buffer_handle = buffer_alloc->gpuAddress() + buffer_offset + state.offset;
     entries[index].stride = state.stride;
-    entries[index++].length = length > state.offset ? length - state.offset : 0;
+    entries[index++].length = valid_length;
     // FIXME: did we intended to use the whole buffer?
     makeResident<PipelineStage::Vertex, kind>(buffer.ptr());
   };
@@ -139,6 +139,9 @@ void
 ArgumentEncodingContext::encodeConstantBuffers(const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT * constant_buffers, uint64_t offset) {
   uint64_t *encoded_buffer = getMappedArgumentBuffer<uint64_t, stage == PipelineStage::Compute>(offset);
 
+  constexpr bool PreRasterStage = stage == PipelineStage::Vertex || stage == PipelineStage::Domain ||
+                                 stage == PipelineStage::Hull || stage == PipelineStage::Geometry;
+
   for (unsigned i = 0; i < reflection->NumConstantBuffers; i++) {
     auto &arg = constant_buffers[i];
     auto slot = 14 * unsigned(stage) + arg.SM50BindingSlot;
@@ -151,8 +154,8 @@ ArgumentEncodingContext::encodeConstantBuffers(const MTL_SHADER_REFLECTION *refl
         continue;
       }
       auto argbuf = cbuf.buffer;
-      // FIXME: did we intended to use the whole buffer?
-      auto [argbuf_alloc, argbuf_offset] = access(argbuf, DXMT_ENCODER_RESOURCE_ACESS_READ);
+      auto valid_length = argbuf->length() > cbuf.offset ? argbuf->length() - cbuf.offset : 0;
+      auto [argbuf_alloc, argbuf_offset] = access<PreRasterStage>(argbuf, cbuf.offset, valid_length, DXMT_ENCODER_RESOURCE_ACESS_READ);
       encoded_buffer[arg.StructurePtrOffset] = argbuf_alloc->gpuAddress() + argbuf_offset + cbuf.offset;
       makeResident<stage, kind>(argbuf.ptr());
       break;
@@ -240,6 +243,9 @@ ArgumentEncodingContext::encodeShaderResources(
 
   auto &UAVBindingSet = stage == PipelineStage::Compute ? cs_uav_ : om_uav_;
 
+  constexpr bool PreRasterStage = stage == PipelineStage::Vertex || stage == PipelineStage::Domain ||
+                                 stage == PipelineStage::Hull || stage == PipelineStage::Geometry;
+
   for (unsigned i = 0; i < BindingCount; i++) {
     auto &arg = arguments[i];
     switch (arg.Type) {
@@ -266,7 +272,7 @@ ArgumentEncodingContext::encodeShaderResources(
 
       if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_BUFFER) {
         if (srv.buffer.ptr()) {
-          auto [srv_alloc, offset] = access(srv.buffer, srv.slice.byteOffset, srv.slice.byteLength, DXMT_ENCODER_RESOURCE_ACESS_READ);
+          auto [srv_alloc, offset] = access<PreRasterStage>(srv.buffer, srv.slice.byteOffset, srv.slice.byteLength, DXMT_ENCODER_RESOURCE_ACESS_READ);
           encoded_buffer[arg.StructurePtrOffset] = srv_alloc->gpuAddress() + offset + srv.slice.byteOffset;
           encoded_buffer[arg.StructurePtrOffset + 1] = srv.slice.byteLength;
           makeResident<stage, kind>(srv.buffer.ptr());
@@ -277,7 +283,7 @@ ArgumentEncodingContext::encodeShaderResources(
       } else if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE) {
         if (srv.buffer.ptr()) {
           assert(arg.Flags & MTL_SM50_SHADER_ARGUMENT_TBUFFER_OFFSET);
-          auto [view, offset] = access(srv.buffer, srv.viewId, DXMT_ENCODER_RESOURCE_ACESS_READ);
+          auto [view, offset] = access<PreRasterStage>(srv.buffer, srv.viewId, DXMT_ENCODER_RESOURCE_ACESS_READ);
           encoded_buffer[arg.StructurePtrOffset] = view.gpu_resource_id;
           encoded_buffer[arg.StructurePtrOffset + 1] =
               ((uint64_t)srv.slice.elementCount << 32) | (uint64_t)(srv.slice.firstElement + offset);
@@ -286,7 +292,7 @@ ArgumentEncodingContext::encodeShaderResources(
           assert(arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_MINLOD_CLAMP);
           auto viewIdChecked = srv.texture->checkViewUseArray(srv.viewId, arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_ARRAY);
           encoded_buffer[arg.StructurePtrOffset] =
-              access(srv.texture, viewIdChecked, DXMT_ENCODER_RESOURCE_ACESS_READ).gpu_resource_id;
+              access<PreRasterStage>(srv.texture, viewIdChecked, DXMT_ENCODER_RESOURCE_ACESS_READ).gpuResourceID;
           encoded_buffer[arg.StructurePtrOffset + 1] = TextureMetadata(srv.texture->arrayLength(viewIdChecked), 0);
           makeResident<stage, kind>(srv.texture.ptr(), viewIdChecked);
         } else {
@@ -306,7 +312,7 @@ ArgumentEncodingContext::encodeShaderResources(
 
       if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_BUFFER) {
         if (uav.buffer.ptr()) {
-          auto [uav_alloc, offset] = access(uav.buffer, uav.slice.byteOffset, uav.slice.byteLength, access_flags);
+          auto [uav_alloc, offset] = access<PreRasterStage>(uav.buffer, uav.slice.byteOffset, uav.slice.byteLength, access_flags);
           encoded_buffer[arg.StructurePtrOffset] = uav_alloc->gpuAddress() + offset + uav.slice.byteOffset;
           encoded_buffer[arg.StructurePtrOffset + 1] = uav.slice.byteLength;
           makeResident<stage, kind>(uav.buffer.ptr(), read, write);
@@ -317,7 +323,7 @@ ArgumentEncodingContext::encodeShaderResources(
       } else if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE) {
         if (uav.buffer.ptr()) {
           assert(arg.Flags & MTL_SM50_SHADER_ARGUMENT_TBUFFER_OFFSET);
-          auto [view, offset] = access(uav.buffer, uav.viewId, access_flags);
+          auto [view, offset] = access<PreRasterStage>(uav.buffer, uav.viewId, access_flags);
           encoded_buffer[arg.StructurePtrOffset] = view.gpu_resource_id;
           encoded_buffer[arg.StructurePtrOffset + 1] =
               ((uint64_t)uav.slice.elementCount << 32) | (uint64_t)(uav.slice.firstElement + offset);
@@ -325,7 +331,7 @@ ArgumentEncodingContext::encodeShaderResources(
         } else if (uav.texture.ptr()) {
           assert(arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_MINLOD_CLAMP);
           auto viewIdChecked = uav.texture->checkViewUseArray(uav.viewId, arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_ARRAY);
-          encoded_buffer[arg.StructurePtrOffset] = access(uav.texture, viewIdChecked, access_flags).gpu_resource_id;
+          encoded_buffer[arg.StructurePtrOffset] = access<PreRasterStage>(uav.texture, viewIdChecked, access_flags).gpuResourceID;
           encoded_buffer[arg.StructurePtrOffset + 1] = TextureMetadata(uav.texture->arrayLength(viewIdChecked), 0);
           makeResident<stage, kind>(uav.texture.ptr(), viewIdChecked, read, write);
         } else {
@@ -335,7 +341,7 @@ ArgumentEncodingContext::encodeShaderResources(
       }
       if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_UAV_COUNTER) {
         if (uav.counter) {
-          auto [counter_alloc, offset] = access(uav.counter, 0, 4, DXMT_ENCODER_RESOURCE_ACESS_READ | DXMT_ENCODER_RESOURCE_ACESS_WRITE);
+          auto [counter_alloc, offset] = access<PreRasterStage>(uav.counter, 0, 4, DXMT_ENCODER_RESOURCE_ACESS_READ | DXMT_ENCODER_RESOURCE_ACESS_WRITE);
           encoded_buffer[arg.StructurePtrOffset + 2] = counter_alloc->gpuAddress() + offset;
           makeResident<stage, kind>(uav.counter.ptr(), true, true);
         } else {
@@ -402,7 +408,7 @@ ArgumentEncodingContext::clearColor(Rc<Texture> &&texture, unsigned viewId, unsi
   encoder_info->height = texture->height();
   encoder_current = encoder_info;
 
-  encoder_info->texture = access(texture, viewId, DXMT_ENCODER_RESOURCE_ACESS_WRITE).texture;
+  encoder_info->attachment = access(texture, viewId, DXMT_ENCODER_RESOURCE_ACESS_WRITE);
 
   currentFrameStatistics().clear_pass_count++;
 
@@ -424,7 +430,7 @@ ArgumentEncodingContext::clearDepthStencil(
   encoder_info->height = texture->height();
   encoder_current = encoder_info;
 
-  encoder_info->texture = access(texture, viewId, DXMT_ENCODER_RESOURCE_ACESS_WRITE).texture;
+  encoder_info->attachment = access(texture, viewId, DXMT_ENCODER_RESOURCE_ACESS_WRITE);
 
   currentFrameStatistics().clear_pass_count++;
   
@@ -440,8 +446,8 @@ ArgumentEncodingContext::resolveTexture(
   encoder_info->type = EncoderType::Resolve;
   encoder_current = encoder_info;
 
-  encoder_info->src = access(src, src_view, DXMT_ENCODER_RESOURCE_ACESS_READ).texture;
-  encoder_info->dst = access(dst, dst_view, DXMT_ENCODER_RESOURCE_ACESS_WRITE).texture;
+  encoder_info->src = access(src, src_view, DXMT_ENCODER_RESOURCE_ACESS_READ);
+  encoder_info->dst = access(dst, dst_view, DXMT_ENCODER_RESOURCE_ACESS_WRITE);
 
   endPass();
 };
@@ -492,7 +498,7 @@ ArgumentEncodingContext::upscaleTemporal(
   encoder_info->input = input->current()->texture();
   encoder_info->output = output->current()->texture();
   encoder_info->depth = depth->current()->texture();
-  encoder_info->motion_vector = motion_vector->view(mvViewId);
+  encoder_info->motion_vector = motion_vector->view(mvViewId).texture;
   encoder_info->scaler = scaler;
   encoder_info->props = props;
 
@@ -558,7 +564,6 @@ ArgumentEncodingContext::startRenderPass(
   auto encoder_info = allocate<RenderEncoderData>();
   encoder_info->type = EncoderType::Render;
   encoder_info->id = nextEncoderId();
-  WMT::InitializeRenderPassInfo(encoder_info->info);
   encoder_info->cmd_head.type = WMTRenderCommandNop;
   encoder_info->cmd_head.next.set(0);
   encoder_info->cmd_tail = (wmtcmd_base *)&encoder_info->cmd_head;
@@ -731,12 +736,59 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
     switch (current->type) {
     case EncoderType::Render: {
       auto data = static_cast<RenderEncoderData *>(current);
+      WMTRenderPassInfo render_pass_info;
+      WMT::InitializeRenderPassInfo(render_pass_info);
+      {
+        for (unsigned i = 0; i < std::size(render_pass_info.colors); i++) {
+          auto &color_data = data->colors[i];
+          if (!color_data.attachment)
+            continue;
+          auto &color_info = render_pass_info.colors[i];
+          color_info.texture = color_data.attachment.texture();
+          color_info.load_action = color_data.load_action;
+          color_info.store_action = color_data.store_action;
+          color_info.level = color_data.level;
+          color_info.slice = color_data.slice;
+          color_info.depth_plane = color_data.depth_plane;
+          color_info.clear_color = color_data.clear_color;
+          color_info.resolve_texture = color_data.resolve_attachment.texture();
+          color_info.resolve_level = color_data.resolve_level;
+          color_info.resolve_slice = color_data.resolve_slice;
+          color_info.resolve_depth_plane = color_data.resolve_depth_plane;
+        }
+        if (data->depth.attachment) {
+          auto &depth_info = render_pass_info.depth;
+          auto &depth_data = data->depth;
+          depth_info.texture = depth_data.attachment.texture();
+          depth_info.load_action = depth_data.load_action;
+          depth_info.store_action = depth_data.store_action;
+          depth_info.level = depth_data.level;
+          depth_info.slice = depth_data.slice;
+          depth_info.depth_plane = depth_data.depth_plane;
+          depth_info.clear_depth = depth_data.clear_depth;
+        }
+        if (data->stencil.attachment) {
+          auto &stencil_info = render_pass_info.stencil;
+          auto &stencil_data = data->stencil;
+          stencil_info.texture = stencil_data.attachment.texture();
+          stencil_info.load_action = stencil_data.load_action;
+          stencil_info.store_action = stencil_data.store_action;
+          stencil_info.level = stencil_data.level;
+          stencil_info.slice = stencil_data.slice;
+          stencil_info.depth_plane = stencil_data.depth_plane;
+          stencil_info.clear_stencil = stencil_data.clear_stencil;
+        }
+        render_pass_info.default_raster_sample_count = data->default_raster_sample_count;
+        render_pass_info.render_target_array_length = data->render_target_array_length;
+        render_pass_info.render_target_width = data->render_target_width;
+        render_pass_info.render_target_height = data->render_target_height;
+      }
       if (data->use_visibility_result) {
         assert(visibility_readback);
-        data->info.visibility_buffer = visibility_readback->visibility_result_heap;
+        render_pass_info.visibility_buffer = visibility_readback->visibility_result_heap;
       }
       auto gpu_buffer_ = data->allocated_argbuf;
-      auto encoder = cmdbuf.renderCommandEncoder(data->info);
+      auto encoder = cmdbuf.renderCommandEncoder(render_pass_info);
       encoder.setVertexBuffer(gpu_buffer_, 0, 16);
       encoder.setVertexBuffer(gpu_buffer_, 0, 29);
       encoder.setVertexBuffer(gpu_buffer_, 0, 30);
@@ -863,13 +915,13 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
         if (data->clear_dsv) {
           if (data->clear_dsv & 1) {
             info.depth.clear_depth = data->depth_stencil.first;
-            info.depth.texture = data->texture;
+            info.depth.texture = data->attachment.texture();
             info.depth.load_action = WMTLoadActionClear;
             info.depth.store_action = WMTStoreActionStore;
           }
           if (data->clear_dsv & 2) {
             info.stencil.clear_stencil = data->depth_stencil.second;
-            info.stencil.texture = data->texture;
+            info.stencil.texture = data->attachment.texture();
             info.stencil.load_action = WMTLoadActionClear;
             info.stencil.store_action = WMTStoreActionStore;
           }
@@ -877,7 +929,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
           info.render_target_height = data->height;
         } else {
           info.colors[0].clear_color = data->color;
-          info.colors[0].texture = data->texture;
+          info.colors[0].texture = data->attachment.texture();
           info.colors[0].load_action = WMTLoadActionClear;
           info.colors[0].store_action = WMTStoreActionStore;
         }
@@ -894,10 +946,10 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       {
         WMTRenderPassInfo info;
         WMT::InitializeRenderPassInfo(info);
-        info.colors[0].texture = data->src;
+        info.colors[0].texture = data->src.texture();
         info.colors[0].load_action = WMTLoadActionLoad;
         info.colors[0].store_action = WMTStoreActionStoreAndMultisampleResolve;
-        info.colors[0].resolve_texture = data->dst;
+        info.colors[0].resolve_texture = data->dst.texture();
 
         auto encoder = cmdbuf.renderCommandEncoder(info);
         encoder.setLabel(WMT::String::string("ResolvePass", WMTUTF8StringEncoding));
@@ -970,7 +1022,7 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
       auto render = reinterpret_cast<RenderEncoderData *>(latter);
       auto clear = reinterpret_cast<ClearEncoderData *>(former);
 
-      if (render->info.render_target_array_length != clear->array_length)
+      if (render->render_target_array_length != clear->array_length)
         break;
 
       if (clear->clear_dsv) {
@@ -1023,10 +1075,26 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
 
       // DontCare can be used because it's going to be cleared anyway
       // just keep in mind DontCare != DontStore
-      if (clear->clear_dsv & 1 && render->info.depth.texture == clear->texture.handle)
-        render->info.depth.store_action = WMTStoreActionDontCare;
-      if (clear->clear_dsv & 2 && render->info.stencil.texture == clear->texture.handle)
-        render->info.stencil.store_action = WMTStoreActionDontCare;
+      if (clear->clear_dsv & 1 && render->depth.attachment == clear->attachment)
+        render->depth.store_action = WMTStoreActionDontCare;
+      if (clear->clear_dsv & 2 && render->stencil.attachment == clear->attachment)
+        render->stencil.store_action = WMTStoreActionDontCare;
+    }
+    if (former->type == EncoderType::Render && latter->type == EncoderType::Resolve) {
+      auto render = reinterpret_cast<RenderEncoderData *>(former);
+      auto resolve = reinterpret_cast<ResolveEncoderData *>(latter);
+      auto result = isResolveSignatureMatched(render, resolve);
+      if (result.src) {
+        result.src->store_action = WMTStoreActionStoreAndMultisampleResolve;
+        result.src->resolve_attachment = result.dst;
+        render->tex_write.merge(resolve->tex_write);
+
+        currentFrameStatistics().resolve_pass_optimized++;
+        resolve->~ResolveEncoderData();
+        resolve->next = nullptr;
+        resolve->type = EncoderType::Null;
+        return DXMT_ENCODER_LIST_OP_SWAP; // carry on (RENDER -> RESOLVE -> RESOLVE -> ...)
+      }
     }
     return hasDataDependency(latter, former) ? DXMT_ENCODER_LIST_OP_SYNCHRONIZE : DXMT_ENCODER_LIST_OP_SWAP;
   }
@@ -1037,18 +1105,18 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
 
     if (isEncoderSignatureMatched(r0, r1)) {
       for (unsigned i = 0; i < r0->render_target_count; i++) {
-        auto &a0 = r0->info.colors[i];
-        auto &a1 = r1->info.colors[i];
+        auto &a0 = r0->colors[i];
+        auto &a1 = r1->colors[i];
         a1.load_action = a0.load_action;
         a1.clear_color = a0.clear_color;
       }
 
-      r1->info.depth.load_action = r0->info.depth.load_action;
-      r1->info.depth.clear_depth = r0->info.depth.clear_depth;
-      r1->info.depth.store_action = r0->info.depth.store_action;
-      r1->info.stencil.load_action = r0->info.stencil.load_action;
-      r1->info.stencil.clear_stencil = r0->info.stencil.clear_stencil;
-      r1->info.stencil.store_action = r0->info.stencil.store_action;
+      r1->depth.load_action = r0->depth.load_action;
+      r1->depth.clear_depth = r0->depth.clear_depth;
+      r1->depth.store_action = r0->depth.store_action;
+      r1->stencil.load_action = r0->stencil.load_action;
+      r1->stencil.clear_stencil = r0->stencil.clear_stencil;
+      r1->stencil.store_action = r0->stencil.store_action;
 
       if ((void *)r0->cmd_tail != &r0->cmd_head) {
         r0->cmd_tail->next.set(r1->cmd_head.next.get());
@@ -1122,7 +1190,7 @@ ArgumentEncodingContext::isEncoderSignatureMatched(RenderEncoderData *r0, Render
     return false;
   if (r0->dsv_readonly_flags != r1->dsv_readonly_flags)
     return false;
-  if (r0->info.render_target_array_length != r1->info.render_target_array_length)
+  if (r0->render_target_array_length != r1->render_target_array_length)
     return false;
   /**
   In case two encoder has different argument buffer
@@ -1132,39 +1200,39 @@ ArgumentEncodingContext::isEncoderSignatureMatched(RenderEncoderData *r0, Render
   if (r0->allocated_argbuf != r1->allocated_argbuf)
     return false;
   if (r0->dsv_planar_flags & 1) {
-    if (r0->info.depth.texture != r1->info.depth.texture)
+    if (r0->depth.attachment != r1->depth.attachment)
       return false;
     if (r0->dsv_readonly_flags & 1) {
-      if (r1->info.depth.load_action == WMTLoadActionClear)
+      if (r1->depth.load_action == WMTLoadActionClear)
         return false;
     } else {
-      if (r0->info.depth.store_action != WMTStoreActionStore)
+      if (r0->depth.store_action != WMTStoreActionStore)
         return false;
-      if (r1->info.depth.load_action != WMTLoadActionLoad)
+      if (r1->depth.load_action != WMTLoadActionLoad)
         return false;
     }
   }
   if (r0->dsv_planar_flags & 2) {
-    if (r0->info.stencil.texture != r1->info.stencil.texture)
+    if (r0->stencil.attachment != r1->stencil.attachment)
       return false;
     if (r0->dsv_readonly_flags & 2) {
-      if (r1->info.stencil.load_action == WMTLoadActionClear)
+      if (r1->stencil.load_action == WMTLoadActionClear)
         return false;
     } else {
-      if (r0->info.stencil.store_action != WMTStoreActionStore)
+      if (r0->stencil.store_action != WMTStoreActionStore)
         return false;
-      if (r1->info.stencil.load_action != WMTLoadActionLoad)
+      if (r1->stencil.load_action != WMTLoadActionLoad)
         return false;
     }
   }
   for (unsigned i = 0; i < r0->render_target_count; i++) {
-    auto &a0 = r0->info.colors[i];
-    auto &a1 = r1->info.colors[i];
-    if (a0.texture != a1.texture)
+    auto &a0 = r0->colors[i];
+    auto &a1 = r1->colors[i];
+    if (a0.attachment != a1.attachment)
       return false;
     if (a0.depth_plane != a1.depth_plane)
       return false;
-    if (!a0.texture)
+    if (!a0.attachment)
       continue;
     if (a0.store_action != WMTStoreActionStore)
       return false;
@@ -1174,33 +1242,65 @@ ArgumentEncodingContext::isEncoderSignatureMatched(RenderEncoderData *r0, Render
   return true;
 }
 
-WMTColorAttachmentInfo *
+RenderEncoderColorAttachmentData *
 ArgumentEncodingContext::isClearColorSignatureMatched(ClearEncoderData *clear, RenderEncoderData *render) {
   for (unsigned i = 0; i < render->render_target_count; i++) {
-    auto &attachment = render->info.colors[i];
-    if (attachment.texture == clear->texture.handle) {
+    auto &attachment = render->colors[i];
+    if (attachment.attachment == clear->attachment) {
       return &attachment;
     }
   }
   return nullptr;
 }
 
-WMTDepthAttachmentInfo *
+RenderEncoderDepthAttachmentData *
 ArgumentEncodingContext::isClearDepthSignatureMatched(ClearEncoderData *clear, RenderEncoderData *render) {
   if ((clear->clear_dsv & 1) == 0)
     return nullptr;
-  if (render->info.depth.texture != clear->texture.handle)
+  if (render->depth.attachment != clear->attachment)
     return nullptr;
-  return &render->info.depth;
+  return &render->depth;
 }
 
-WMTStencilAttachmentInfo *
+RenderEncoderStencilAttachmentData *
 ArgumentEncodingContext::isClearStencilSignatureMatched(ClearEncoderData *clear, RenderEncoderData *render) {
   if ((clear->clear_dsv & 2) == 0)
     return nullptr;
-  if (render->info.stencil.texture != clear->texture.handle)
+  if (render->stencil.attachment != clear->attachment)
     return nullptr;
-  return &render->info.stencil;
+  return &render->stencil;
+}
+
+ArgumentEncodingContext::ResolveSignatureMatchResult
+ArgumentEncodingContext::isResolveSignatureMatched(RenderEncoderData *render, ResolveEncoderData *resolve) {
+  ResolveSignatureMatchResult ret{};
+  for (unsigned i = 0; i < render->render_target_count; i++) {
+    auto &color = render->colors[i];
+    if (!color.attachment)
+      continue;
+    if (color.store_action != WMTStoreActionStore)
+      continue;
+    if (color.resolve_attachment)
+      continue;
+    if (color.attachment->allocation != resolve->src->allocation)
+      continue;
+    if (color.attachment->key == resolve->src->key) {
+      ret.src = &color;
+      ret.dst = resolve->dst;
+      break;
+    };
+    auto &descriptor_src = resolve->src->allocation->descriptor;
+    auto &descriptor_dst = resolve->dst->allocation->descriptor;
+    auto color_format = descriptor_src->pixelFormat(color.attachment->key);
+    auto view_src_in_color_format = descriptor_src->checkViewUseFormat(resolve->src->key, color_format);
+    if (color.attachment->key == view_src_in_color_format) {
+      auto view_dst_in_color_format = descriptor_dst->checkViewUseFormat(resolve->dst->key, color_format);
+      ret.src = &color;
+      ret.dst = descriptor_dst->view(view_dst_in_color_format, resolve->dst->allocation);
+      break;
+    }
+  }
+  return ret;
 }
 
 } // namespace dxmt
